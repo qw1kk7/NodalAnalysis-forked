@@ -2,13 +2,13 @@
 
 from typing import Optional
 
-from PySide6.QtCore import QMimeData, QPoint, Qt
-from PySide6.QtGui import QDrag, QMouseEvent
+from PySide6.QtCore import QMimeData, QPoint, QPointF, QSize, Qt
+from PySide6.QtGui import QColor, QDrag, QIcon, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
-    QLabel,
     QMainWindow,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QToolBar,
     QVBoxLayout,
@@ -18,8 +18,37 @@ from PySide6.QtWidgets import (
 from gui.circuit_canvas import MIME_TYPE, CircuitCanvas
 from gui.components import extract_circuit_from_gui
 from gui.properties_panel import PropertiesPanel
+from gui import theme
 from math_engine.circuit import InvalidCircuitError
 from math_engine.nodal_analysis import solve_circuit
+
+
+def _symbol_icon(kind: str) -> QIcon:
+    """Small schematic symbol drawn with QPainter, used on the palette buttons."""
+    size = 28
+    pixmap = QPixmap(size * 2, size * 2)
+    pixmap.setDevicePixelRatio(2.0)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(QColor(theme.INK), 1.6))
+    painter.translate(size / 2, size / 2)
+    if kind == "resistor":
+        path = QPainterPath()
+        path.moveTo(-13, 0)
+        for x, y in [(-8, 0), (-6, -5), (-2, 5), (2, -5), (6, 5), (8, 0), (13, 0)]:
+            path.lineTo(x, y)
+        painter.drawPath(path)
+        segments = []
+    elif kind == "current_source":
+        painter.drawEllipse(QPointF(0, 0), 8.5, 8.5)
+        segments = [((-5, 0), (5, 0)), ((2, -3), (5, 0)), ((2, 3), (5, 0))]
+    else:
+        segments = [((0, -10), (0, -2)), ((-9, -2), (9, -2)), ((-5.5, 2.5), (5.5, 2.5)), ((-2, 7), (2, 7))]
+    for a, b in segments:
+        painter.drawLine(QPointF(*a), QPointF(*b))
+    painter.end()
+    return QIcon(pixmap)
 
 
 class DraggableComponentButton(QPushButton):
@@ -29,7 +58,11 @@ class DraggableComponentButton(QPushButton):
         super().__init__(label, parent)
         self.kind = kind
         self._drag_start_pos: Optional[QPoint] = None
-        self.setMinimumHeight(40)
+        self.setObjectName("PaletteButton")
+        self.setIcon(_symbol_icon(kind))
+        self.setIconSize(QSize(28, 28))
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("Drag onto the canvas, or click to place in the centre")
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
@@ -55,7 +88,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("DC Circuit Simulator — Nodal Analysis & Gaussian Elimination")
-        self.resize(1280, 780)
+        self.resize(1320, 800)
+        self.setMinimumSize(960, 600)
 
         self.canvas = CircuitCanvas()
         self.properties_panel = PropertiesPanel()
@@ -80,12 +114,15 @@ class MainWindow(QMainWindow):
         self.btn_delete = QPushButton("Delete (Del)")
         self.btn_clear = QPushButton("Clear All")
 
-        self.btn_solve = QPushButton("  Solve Circuit  ")
-        self.btn_solve.setStyleSheet(
-            "QPushButton { background-color: #2E7D32; color: white; font-weight: bold; "
-            "padding: 6px 14px; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #1B5E20; }"
-        )
+        self.btn_solve = QPushButton("Solve Circuit")
+        self.btn_solve.setObjectName("PrimaryButton")
+        self.btn_solve.setToolTip("Build G·V = I and solve it with Gaussian elimination")
+
+        self.btn_select_mode.setToolTip("Select, move and edit components")
+        self.btn_wire_mode.setToolTip("Click an existing wire to branch from a new junction")
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         toolbar.addWidget(self.btn_select_mode)
         toolbar.addWidget(self.btn_wire_mode)
@@ -93,49 +130,53 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.btn_rotate)
         toolbar.addWidget(self.btn_delete)
         toolbar.addWidget(self.btn_clear)
-        toolbar.addSeparator()
+        toolbar.addWidget(spacer)
         toolbar.addWidget(self.btn_solve)
 
     def _build_central_layout(self) -> None:
         # Left Component Palette
         palette = QWidget()
-        palette.setFixedWidth(185)
+        palette.setObjectName("PaletteSidebar")
+        palette.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        palette.setFixedWidth(200)
         palette_layout = QVBoxLayout(palette)
-        palette_layout.setContentsMargins(8, 10, 8, 10)
-        palette_layout.setSpacing(8)
+        palette_layout.setContentsMargins(12, 14, 12, 12)
+        palette_layout.setSpacing(6)
 
-        title = QLabel("Components\n(Drag or Click)")
-        title.setStyleSheet("font-weight: bold; font-size: 13px;")
-        palette_layout.addWidget(title)
+        palette_layout.addWidget(theme.label("Components", "SectionTitle", theme.caption_font()))
+        palette_layout.addWidget(theme.label("Drag onto the canvas or click", "SectionHint"))
+        palette_layout.addSpacing(4)
 
-        self.btn_resistor = DraggableComponentButton("Resistor (Ω)", "resistor")
-        self.btn_current_source = DraggableComponentButton("Current Source (A)", "current_source")
-        self.btn_ground = DraggableComponentButton("Ground (0 V)", "ground")
+        self.btn_resistor = DraggableComponentButton("Resistor", "resistor")
+        self.btn_current_source = DraggableComponentButton("Current Source", "current_source")
+        self.btn_ground = DraggableComponentButton("Ground", "ground")
 
         palette_layout.addWidget(self.btn_resistor)
         palette_layout.addWidget(self.btn_current_source)
         palette_layout.addWidget(self.btn_ground)
 
-        help_label = QLabel(
-            "Tips:\n"
-            "• Drag components onto canvas\n"
-            "• Click a terminal to start/end a wire\n"
-            "• Click an existing wire while wiring to add a junction\n"
-            "• Scroll to zoom, right/middle-drag to pan\n"
-            "• Press R to rotate, Del to delete"
+        palette_layout.addSpacing(16)
+        palette_layout.addWidget(theme.label("How To", "SectionTitle", theme.caption_font()))
+        help_text = (
+            "Click a terminal to start a wire, then click another terminal to finish it."
+            "<br><br>While wiring, click an existing wire to add a junction."
+            "<br><br>Scroll to zoom. Right or middle drag to pan."
+            "<br><br><b>R</b> Rotate &nbsp;&middot;&nbsp; <b>Del</b> Delete"
+            "<br><b>Esc</b> Cancel Wire"
         )
-        help_label.setWordWrap(True)
-        help_label.setStyleSheet("color: #546E7A; font-size: 11px; margin-top: 12px;")
-        palette_layout.addWidget(help_label)
+        palette_layout.addWidget(theme.label(help_text, "HelpText", wrap=True))
         palette_layout.addStretch(1)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(1)
+        splitter.setChildrenCollapsible(False)
         splitter.addWidget(palette)
         splitter.addWidget(self.canvas)
         splitter.addWidget(self.properties_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
+        splitter.setSizes([200, 720, 420])
 
         container = QWidget()
         container_layout = QHBoxLayout(container)

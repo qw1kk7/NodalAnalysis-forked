@@ -1,9 +1,9 @@
 """Properties editor and mathematical results panel."""
 
+import html
 from typing import Optional
 
-from PySide6.QtCore import Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
@@ -16,20 +16,45 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gui import theme
 from gui.components import ComponentItem, ExtractionResult
+from gui.matrix_view import MatrixPanel
+from gui.number_format import fixed, fraction_suffix
 from math_engine.nodal_analysis import SolutionResult
 
 
-def _format_matrix(matrix: list[list[float]], row_labels: Optional[list[str]] = None) -> str:
-    """Format a 2D list of floats into an aligned monospace text block."""
-    if not matrix:
-        return "(empty)"
-    lines: list[str] = []
-    for idx, row in enumerate(matrix):
-        prefix = f"{row_labels[idx]:>4}: " if row_labels and idx < len(row_labels) else ""
-        cells = "  ".join(f"{val:9.4f}" for val in row)
-        lines.append(f"{prefix}[ {cells} ]")
-    return "\n".join(lines)
+def _report_html(text: str) -> str:
+    """Present a plain-text report with real headings."""
+    heading_style = (
+        f"font-family: '{theme.UI_FONT_FAMILY}'; font-size: {theme.SIZE_SMALL}pt; "
+        f"font-weight: bold; color: {theme.TEXT_MUTED};"
+    )
+    mono_families = ", ".join(f"'{f}'" for f in theme.MONO_FONT_FAMILIES)
+    pre_style = f"font-family: {mono_families}, monospace; font-size: {theme.SIZE_MONO}pt; color: {theme.TEXT}; margin: 0;"
+    parts: list[str] = []
+    block: list[str] = []
+    first_heading = True
+
+    def flush() -> None:
+        while block and not block[-1].strip():
+            block.pop()
+        while block and not block[0].strip():
+            block.pop(0)
+        if block:
+            parts.append(f'<pre style="{pre_style}">{html.escape(chr(10).join(block))}</pre>')
+        block.clear()
+
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("===") and stripped.endswith("===") and len(stripped) > 6:
+            flush()
+            top, first_heading = (0 if first_heading else 14), False
+            title = html.escape(stripped.strip("= "))
+            parts.append(f'<p style="{heading_style} margin-top: {top}px; margin-bottom: 4px;">{title}</p>')
+        else:
+            block.append(line)
+    flush()
+    return "".join(parts)
 
 
 class PropertiesPanel(QWidget):
@@ -40,19 +65,26 @@ class PropertiesPanel(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setMinimumWidth(330)
+        self.setObjectName("PropertiesPanel")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setMinimumWidth(360)
         self._current_comp_id: Optional[str] = None
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 14, 12, 12)
+        layout.setSpacing(6)
 
         # --- Selected Item Properties ---
-        self.prop_group = QGroupBox("Selected Item Properties")
-        self.prop_form = QFormLayout(self.prop_group)
+        layout.addWidget(theme.label("Selected Item", "SectionTitle", theme.caption_font()))
 
-        self.lbl_id = QLabel("-")
-        self.lbl_type = QLabel("-")
+        self.prop_group = QGroupBox()
+        self.prop_form = QFormLayout(self.prop_group)
+        self.prop_form.setHorizontalSpacing(14)
+        self.prop_form.setVerticalSpacing(7)
+        self.prop_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        self.lbl_id = QLabel("—")
+        self.lbl_type = QLabel("—")
         self.lbl_value_title = QLabel("Value:")
         self.edit_value = QLineEdit()
         self.edit_value.setVisible(False)
@@ -69,8 +101,24 @@ class PropertiesPanel(QWidget):
         self.lbl_extra_3_title = QLabel("")
         self.lbl_extra_3 = QLabel("")
 
-        self.prop_form.addRow("ID:", self.lbl_id)
-        self.prop_form.addRow("Type:", self.lbl_type)
+        id_title = QLabel("ID:")
+        type_title = QLabel("Type:")
+        for title_lbl in (
+            id_title,
+            type_title,
+            self.lbl_value_title,
+            self.lbl_extra_1_title,
+            self.lbl_extra_2_title,
+            self.lbl_extra_3_title,
+        ):
+            title_lbl.setObjectName("FormLabel")
+        self.lbl_id.setObjectName("SelectionId")
+        self.lbl_type.setObjectName("SelectionType")
+        for value_lbl in (self.lbl_extra_1, self.lbl_extra_2, self.lbl_extra_3):
+            value_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        self.prop_form.addRow(id_title, self.lbl_id)
+        self.prop_form.addRow(type_title, self.lbl_type)
         self.prop_form.addRow(self.lbl_value_title, self.edit_value)
         self.prop_form.addRow("", self.btn_flip)
         self.prop_form.addRow(self.lbl_extra_1_title, self.lbl_extra_1)
@@ -78,36 +126,34 @@ class PropertiesPanel(QWidget):
         self.prop_form.addRow(self.lbl_extra_3_title, self.lbl_extra_3)
 
         layout.addWidget(self.prop_group)
+        layout.addSpacing(10)
 
         # --- Solver Status & Results ---
-        self.status_label = QLabel("Status: Not solved")
-        self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet(
-            "padding: 6px; border-radius: 4px; background: #ECEFF1; font-weight: bold;"
-        )
+        layout.addWidget(theme.label("Results", "SectionTitle", theme.caption_font()))
+        self.status_label = theme.label(wrap=True)
+        self._set_status("Status: Not Solved", theme.STATUS_NEUTRAL)
         layout.addWidget(self.status_label)
+        layout.addSpacing(4)
 
         self.tabs = QTabWidget()
-        mono_font = QFont("Consolas", 9)
+        self.tabs.setDocumentMode(False)
+        self.summary_text, self.branches_text = QTextEdit(), QTextEdit()
+        for box in (self.summary_text, self.branches_text):
+            box.setReadOnly(True)
+            box.setFont(theme.mono_font())
+            box.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.matrices_view = MatrixPanel()
 
-        self.summary_text = QTextEdit()
-        self.summary_text.setReadOnly(True)
-        self.summary_text.setFont(mono_font)
-
-        self.branches_text = QTextEdit()
-        self.branches_text.setReadOnly(True)
-        self.branches_text.setFont(mono_font)
-
-        self.matrices_text = QTextEdit()
-        self.matrices_text.setReadOnly(True)
-        self.matrices_text.setFont(mono_font)
-
-        self.tabs.addTab(self.summary_text, "Nodes & Verify")
+        self.tabs.addTab(self.summary_text, "Nodes && Verify")
         self.tabs.addTab(self.branches_text, "Branches")
-        self.tabs.addTab(self.matrices_text, "Matrices (G, I, U)")
+        self.tabs.addTab(self.matrices_view, "Matrices (G, I, U)")
         layout.addWidget(self.tabs, stretch=1)
 
         self.show_empty_selection()
+
+    def _set_status(self, text: str, variant: tuple[str, str, str]) -> None:
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(theme.status_style(variant))
 
     def _on_value_edited(self) -> None:
         if self._current_comp_id is None:
@@ -136,8 +182,8 @@ class PropertiesPanel(QWidget):
 
     def show_empty_selection(self) -> None:
         self._current_comp_id = None
-        self.lbl_id.setText("-")
-        self.lbl_type.setText("None")
+        self.lbl_id.setText("—")
+        self.lbl_type.setText("Nothing Selected")
         self.lbl_value_title.setVisible(False)
         self.edit_value.setVisible(False)
         self.btn_flip.setVisible(False)
@@ -168,13 +214,13 @@ class PropertiesPanel(QWidget):
                 if res is not None:
                     self._set_extra_rows(
                         [
-                            ("Voltage Drop:", f"{res.voltage_drop:.4f} V ({res.node_a} → {res.node_b})"),
-                            ("Current:", f"{res.current:.4f} A"),
-                            ("Power:", f"{res.power:.4f} W"),
+                            ("Voltage Drop:", f"{fixed(res.voltage_drop, 4)} V ({res.node_a} → {res.node_b})"),
+                            ("Current:", f"{fixed(res.current, 4)} A"),
+                            ("Power:", f"{fixed(res.power, 4)} W"),
                         ]
                     )
                     return
-            self._set_extra_rows([("Calculated:", "Solve circuit to view")])
+            self._set_extra_rows([("Calculated:", "Click Solve Circuit to view")])
 
         elif comp.kind == "current_source":
             self.lbl_type.setText("DC Current Source")
@@ -196,7 +242,7 @@ class PropertiesPanel(QWidget):
             self.lbl_value_title.setVisible(False)
             self.edit_value.setVisible(False)
             self.btn_flip.setVisible(False)
-            self._set_extra_rows([("Voltage:", "0.0000 V")])
+            self._set_extra_rows([("Voltage:", "0 V")])
 
     def show_wire(
         self,
@@ -215,11 +261,12 @@ class PropertiesPanel(QWidget):
             node_name = extraction.wire_to_node[wire_id]
             connected = ", ".join(extraction.wire_to_components.get(wire_id, [])) or "None"
             if node_name == "GND":
-                voltage_str = "0.0000 V (Ground)"
+                voltage_str = "0 V (Ground)"
             elif solution is not None and node_name in solution.node_voltages:
-                voltage_str = f"{solution.node_voltages[node_name]:.4f} V"
+                voltage = solution.node_voltages[node_name]
+                voltage_str = f"{fixed(voltage, 4)} V{fraction_suffix(voltage)}"
             else:
-                voltage_str = "Not solved"
+                voltage_str = "Not Solved"
             self._set_extra_rows(
                 [
                     ("Node:", node_name),
@@ -228,44 +275,36 @@ class PropertiesPanel(QWidget):
                 ]
             )
         else:
-            self._set_extra_rows([("Node:", "Solve circuit to inspect")])
+            self._set_extra_rows([("Node:", "Click Solve Circuit to inspect")])
 
-    def clear_results(self, message: str = "Status: Circuit modified — click Solve") -> None:
-        self.status_label.setText(message)
-        self.status_label.setStyleSheet(
-            "padding: 6px; border-radius: 4px; background: #FFF8E1; color: #795548; font-weight: bold;"
-        )
+    def clear_results(self, message: str = "Status: Circuit Modified — Click Solve Circuit") -> None:
+        self._set_status(message, theme.STATUS_WARNING)
         self.summary_text.clear()
         self.branches_text.clear()
-        self.matrices_text.clear()
+        self.matrices_view.clear()
 
     def show_error(self, error_message: str) -> None:
-        self.status_label.setText(f"Error: {error_message}")
-        self.status_label.setStyleSheet(
-            "padding: 6px; border-radius: 4px; background: #FFEBEE; color: #B71C1C; font-weight: bold;"
-        )
+        self._set_status(f"Error: {error_message}", theme.STATUS_ERROR)
         self.summary_text.setPlainText(f"Cannot solve circuit:\n{error_message}")
         self.branches_text.clear()
-        self.matrices_text.clear()
+        self.matrices_view.clear()
 
     def show_solution(self, solution: SolutionResult, extraction: ExtractionResult) -> None:
         v = solution.verification
         if v.passed:
-            self.status_label.setText("Verification: PASSED (G*V = I and KCL satisfied)")
-            self.status_label.setStyleSheet(
-                "padding: 6px; border-radius: 4px; background: #E8F5E9; color: #1B5E20; font-weight: bold;"
-            )
+            self._set_status("Verification: PASSED (G*V = I and KCL satisfied)", theme.STATUS_SUCCESS)
         else:
-            self.status_label.setText("Verification: FAILED (numerical residual exceeded tolerance)")
-            self.status_label.setStyleSheet(
-                "padding: 6px; border-radius: 4px; background: #FFEBEE; color: #B71C1C; font-weight: bold;"
-            )
+            self._set_status("Verification: FAILED (numerical residual exceeded tolerance)", theme.STATUS_ERROR)
 
         # 1. Summary & Verification tab
         summary_lines = ["=== Node Voltages ==="]
-        for node_name in ["GND"] + solution.non_ground_nodes:
+        all_nodes = ["GND"] + solution.non_ground_nodes
+        v_width = max(len(fixed(solution.node_voltages[n], 6)) for n in all_nodes)
+        for node_name in all_nodes:
             voltage = solution.node_voltages[node_name]
-            summary_lines.append(f"  {node_name:<6} : {voltage:10.6f} V")
+            summary_lines.append(
+                f"  {node_name:<6} : {fixed(voltage, 6, v_width)} V{fraction_suffix(voltage)}"
+            )
 
         summary_lines.append("\n=== Verification ===")
         summary_lines.append(f"  Passed        : {v.passed}")
@@ -274,36 +313,40 @@ class PropertiesPanel(QWidget):
         summary_lines.append("\n  KCL Sum per Node:")
         for node_name, err in v.kcl_errors.items():
             summary_lines.append(f"    {node_name:<6} : {err:+.3e} A")
-        self.summary_text.setPlainText("\n".join(summary_lines))
+        self.summary_text.setHtml(_report_html("\n".join(summary_lines)))
 
         # 2. Branches tab
         branch_lines = ["=== Resistors (Ohm's Law) ==="]
         if not solution.resistor_results:
-            branch_lines.append("  (none)")
-        for r in solution.resistor_results:
+            branch_lines.append("  (None)")
+        results = solution.resistor_results
+        vd_w = max((len(fixed(r.voltage_drop, 4)) for r in results), default=0)
+        i_w = max((len(fixed(r.current, 4)) for r in results), default=0)
+        p_w = max((len(fixed(r.power, 4)) for r in results), default=0)
+        for r in results:
             branch_lines.append(
                 f"  {r.component_id:<4} ({r.node_a} -> {r.node_b}, R={r.resistance:g} Ω):\n"
-                f"       V_drop = {r.voltage_drop:9.4f} V | I = {r.current:9.4f} A | P = {r.power:9.4f} W"
+                f"       V_drop = {fixed(r.voltage_drop, 4, vd_w)} V | I = {fixed(r.current, 4, i_w)} A"
+                f" | P = {fixed(r.power, 4, p_w)} W"
             )
 
         branch_lines.append("\n=== DC Current Sources ===")
         if not extraction.circuit.current_sources:
-            branch_lines.append("  (none)")
-        for src in extraction.circuit.current_sources:
+            branch_lines.append("  (None)")
+        sources = extraction.circuit.current_sources
+        src_w = max((len(fixed(src.current, 4)) for src in sources), default=0)
+        for src in sources:
             branch_lines.append(
-                f"  {src.component_id:<4} ({src.node_from} -> {src.node_to}): I = {src.current:9.4f} A"
+                f"  {src.component_id:<4} ({src.node_from} -> {src.node_to}): I = {fixed(src.current, 4, src_w)} A"
             )
-        self.branches_text.setPlainText("\n".join(branch_lines))
+        self.branches_text.setHtml(_report_html("\n".join(branch_lines)))
 
         # 3. Matrices tab
         nodes = solution.non_ground_nodes
-        i_col = [[val] for val in solution.vector_i]
-        matrix_lines = [
-            "=== Conductance Matrix G (S) ===",
-            _format_matrix(solution.matrix_g, nodes),
-            "\n=== Current Injection Vector I (A) ===",
-            _format_matrix(i_col, nodes),
-            "\n=== Gaussian Elimination Upper Triangular [U | c] ===",
-            _format_matrix(solution.upper_triangular, nodes),
-        ]
-        self.matrices_text.setPlainText("\n".join(matrix_lines))
+        self.matrices_view.show_matrices(
+            matrix_g=solution.matrix_g,
+            vector_i=solution.vector_i,
+            upper_triangular=solution.upper_triangular,
+            node_names=nodes,
+            node_voltages=[solution.node_voltages[n] for n in nodes],
+        )

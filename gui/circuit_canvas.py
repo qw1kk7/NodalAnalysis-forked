@@ -8,6 +8,7 @@ from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QFontMetrics,
     QKeyEvent,
     QMouseEvent,
     QPainter,
@@ -17,6 +18,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
+from gui import theme
+from gui.number_format import fixed, fraction_suffix
 from gui.components import (
     ComponentItem,
     EndpointKey,
@@ -158,7 +161,16 @@ class CircuitCanvas(QWidget):
         if self.selected_kind == "component" and self.selected_id in self.components:
             comp = self.components[self.selected_id]
             if comp.kind == "current_source":
+                # Swap terminal indices on the attached wires: the wires stay put on screen while
+                # the source's from/to nodes (and so its current direction) are reversed.
                 comp.rotation = (comp.rotation + 180) % 360
+                swap = {0: 1, 1: 0}
+                for wire in self.wires.values():
+                    if wire.start[0] == "terminal" and wire.start[1] == comp.component_id:
+                        wire.start = ("terminal", comp.component_id, swap[wire.start[2]])
+                    if wire.end[0] == "terminal" and wire.end[1] == comp.component_id:
+                        wire.end = ("terminal", comp.component_id, swap[wire.end[2]])
+                self._wire_start_endpoint = None
                 self.circuit_modified.emit()
                 self.update()
 
@@ -418,7 +430,7 @@ class CircuitCanvas(QWidget):
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#FAFAFA"))
+        painter.fillRect(self.rect(), QColor(theme.CANVAS_BG))
 
         painter.translate(self.pan_offset)
         painter.scale(self.zoom, self.zoom)
@@ -437,7 +449,7 @@ class CircuitCanvas(QWidget):
         start_y = int(math.floor(top_left.y() / GRID_SIZE) * GRID_SIZE)
         end_y = int(math.ceil(bottom_right.y() / GRID_SIZE) * GRID_SIZE)
 
-        painter.setPen(QPen(QColor("#E0E0E0"), 1.0))
+        painter.setPen(QPen(QColor(theme.GRID_DOT), 1.4 / max(self.zoom, 0.5)))
         for gx in range(start_x, end_x + 1, int(GRID_SIZE)):
             for gy in range(start_y, end_y + 1, int(GRID_SIZE)):
                 painter.drawPoint(gx, gy)
@@ -447,8 +459,10 @@ class CircuitCanvas(QWidget):
             x1, y1 = resolve_endpoint_position(wire.start, self.components, self.junctions)
             x2, y2 = resolve_endpoint_position(wire.end, self.components, self.junctions)
             is_selected = self.selected_kind == "wire" and self.selected_id == wid
-            color = QColor("#1976D2") if is_selected else QColor("#263238")
-            painter.setPen(QPen(color, 3.0 if is_selected else 2.2))
+            color = QColor(theme.SELECTED) if is_selected else QColor(theme.WIRE)
+            pen = QPen(color, 3.0 if is_selected else 2.0)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
             painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
     def _draw_active_wire_preview(self, painter: QPainter) -> None:
@@ -457,7 +471,7 @@ class CircuitCanvas(QWidget):
         sx, sy = resolve_endpoint_position(
             self._wire_start_endpoint, self.components, self.junctions
         )
-        pen = QPen(QColor("#1976D2"), 2.0, Qt.PenStyle.DashLine)
+        pen = QPen(QColor(theme.SELECTED), 1.8, Qt.PenStyle.DashLine)
         painter.setPen(pen)
         painter.drawLine(QPointF(sx, sy), self._mouse_world)
 
@@ -465,22 +479,72 @@ class CircuitCanvas(QWidget):
         for jid, junction in self.junctions.items():
             ep: EndpointKey = ("junction", jid, 0)
             is_hover = ep == self._hover_endpoint or ep == self._wire_start_endpoint
-            painter.setPen(QPen(QColor("#0D47A1") if is_hover else QColor("#263238"), 1.5))
-            painter.setBrush(QBrush(QColor("#42A5F5") if is_hover else QColor("#263238")))
-            painter.drawEllipse(QPointF(junction.x, junction.y), 5.0, 5.0)
+            color = QColor(theme.TERMINAL_ACTIVE) if is_hover else QColor(theme.WIRE)
+            painter.setPen(QPen(color, 1.0))
+            painter.setBrush(QBrush(color))
+            radius = 5.0 if is_hover else 4.0
+            painter.drawEllipse(QPointF(junction.x, junction.y), radius, radius)
+
+    def _draw_node_tag(
+        self, painter: QPainter, tx: float, ty: float, dx: float, dy: float, text: str, is_ground: bool
+    ) -> None:
+        """Draw a small voltage tag next to a terminal, on the side facing away from the part."""
+        metrics = painter.fontMetrics()
+        width = metrics.horizontalAdvance(text) + 8.0
+        height = metrics.height() + 2.0
+        gap = 6.0
+
+        if abs(dx) >= abs(dy):
+            left = tx + gap if dx > 0 else tx - gap - width
+            top = ty - gap - height
+        else:
+            left = tx + gap
+            top = ty - gap - height if dy < 0 else ty + gap
+
+        rect = QRectF(left, top, width, height)
+
+        drawn = getattr(self, "_drawn_tags", None)
+        if drawn is not None:
+            def collides(r: QRectF) -> list[tuple[QRectF, str]]:
+                padded = r.adjusted(-2.0, -1.0, 2.0, 1.0)
+                return [(other, other_text) for other, other_text in drawn if padded.intersects(other)]
+
+            if any(other_text == text for _, other_text in collides(rect)):
+                return
+            step = -(height + 2.0) if rect.center().y() <= ty else (height + 2.0)
+            for _ in range(3):
+                if not collides(rect):
+                    break
+                rect.translate(0.0, step)
+            drawn.append((QRectF(rect), text))
+
+        bg, border, fg = (
+            (theme.SURFACE_ALT, theme.BORDER, theme.TEXT_FAINT)
+            if is_ground
+            else (theme.NODE_LABEL_BG, theme.NODE_LABEL_BORDER, theme.NODE_LABEL_TEXT)
+        )
+        painter.setPen(QPen(QColor(border), 0.8))
+        painter.setBrush(QBrush(QColor(bg)))
+        painter.drawRoundedRect(rect, 3.0, 3.0)
+        theme.draw_text(painter, rect, text, painter.font(), fg)
 
     def _draw_components(self, painter: QPainter) -> None:
-        label_font = QFont("Segoe UI", 9, QFont.Weight.DemiBold)
-        node_font = QFont("Segoe UI", 8)
+        id_font = theme.ui_font(theme.SIZE_SMALL, QFont.Weight.DemiBold)
+        value_font = theme.ui_font(8.5)
+        node_font = theme.mono_font(7.5)
+        self._drawn_tags: list[tuple[QRectF, str]] = []
 
         for comp in self.components.values():
             is_selected = self.selected_kind == "component" and self.selected_id == comp.component_id
-            stroke = QColor("#1976D2") if is_selected else QColor("#1A1A1A")
+            stroke = QColor(theme.SELECTED) if is_selected else QColor(theme.INK)
 
             painter.save()
             painter.translate(comp.x, comp.y)
             painter.rotate(comp.rotation)
-            painter.setPen(QPen(stroke, 2.2))
+            pen = QPen(stroke, 2.0)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
 
             if comp.kind == "resistor":
@@ -502,11 +566,15 @@ class CircuitCanvas(QWidget):
                 # Leads + circle + arrow pointing from T0 (-45) to T1 (+45)
                 painter.drawLine(-45, 0, -20, 0)
                 painter.drawLine(20, 0, 45, 0)
-                painter.setBrush(QBrush(QColor("#FFFFFF")))
+                painter.setBrush(QBrush(QColor(theme.CANVAS_BG)))
                 painter.drawEllipse(QPointF(0, 0), 20, 20)
                 painter.drawLine(-12, 0, 12, 0)
-                painter.drawLine(5, -6, 12, 0)
-                painter.drawLine(5, 6, 12, 0)
+                arrow = QPainterPath()
+                arrow.moveTo(5, -6)
+                arrow.lineTo(12, 0)
+                arrow.lineTo(5, 6)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPath(arrow)
 
             elif comp.kind == "ground":
                 painter.drawLine(0, -24, 0, 0)
@@ -515,39 +583,48 @@ class CircuitCanvas(QWidget):
                 painter.drawLine(-5, 14, 5, 14)
 
             if is_selected:
-                painter.setPen(QPen(QColor("#64B5F6"), 1.2, Qt.PenStyle.DashLine))
+                painter.setPen(QPen(QColor(theme.SELECTED_OUTLINE), 1.0, Qt.PenStyle.DashLine))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(QRectF(-34, -26, 68, 52))
+                painter.drawRoundedRect(QRectF(-34, -26, 68, 52), 4.0, 4.0)
 
             painter.restore()
 
             # Draw upright text label above/below component
-            painter.setFont(label_font)
-            painter.setPen(QPen(QColor("#1A1A1A")))
-            if comp.kind == "resistor":
-                text = f"{comp.component_id} ({comp.value:g} Ω)"
-                painter.drawText(QRectF(comp.x - 60, comp.y - 42, 120, 20), Qt.AlignmentFlag.AlignCenter, text)
-            elif comp.kind == "current_source":
-                text = f"{comp.component_id} ({comp.value:g} A)"
-                painter.drawText(QRectF(comp.x - 60, comp.y - 46, 120, 20), Qt.AlignmentFlag.AlignCenter, text)
+            left_mid = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            right_mid = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            if comp.kind in ("resistor", "current_source"):
+                value_text = f"{comp.value:g} {'Ω' if comp.kind == 'resistor' else 'A'}"
+                if comp.rotation in (90, 270):
+                    x = comp.x - (26 if comp.kind == "current_source" else 18) - 80
+                    theme.draw_text(painter, QRectF(x, comp.y - 18, 80, 18), comp.component_id, id_font, theme.TEXT, right_mid)
+                    theme.draw_text(painter, QRectF(x, comp.y, 80, 18), value_text, value_font, theme.TEXT_MUTED, right_mid)
+                else:
+                    top = comp.y - (46 if comp.kind == "current_source" else 40)
+                    id_w = QFontMetrics(id_font).horizontalAdvance(comp.component_id)
+                    value_w = QFontMetrics(value_font).horizontalAdvance(value_text)
+                    x = comp.x - (id_w + 6 + value_w) / 2
+                    theme.draw_text(painter, QRectF(x, top, id_w + 2, 20), comp.component_id, id_font, theme.TEXT, left_mid)
+                    theme.draw_text(painter, QRectF(x + id_w + 6, top, value_w + 2, 20), value_text, value_font, theme.TEXT_MUTED, left_mid)
             else:
-                painter.drawText(QRectF(comp.x - 40, comp.y + 16, 80, 18), Qt.AlignmentFlag.AlignCenter, comp.component_id)
+                theme.draw_text(painter, QRectF(comp.x - 40, comp.y + 18, 80, 18), comp.component_id, id_font, theme.TEXT_MUTED)
 
             # Draw terminals and solved node badges
             for idx, (tx, ty) in enumerate(comp.terminal_positions()):
                 ep: EndpointKey = ("terminal", comp.component_id, idx)
                 is_active = ep == self._hover_endpoint or ep == self._wire_start_endpoint
-                painter.setPen(QPen(QColor("#0D47A1") if is_active else QColor("#37474F"), 1.5))
-                painter.setBrush(QBrush(QColor("#4CAF50") if is_active else QColor("#FFFFFF")))
-                painter.drawEllipse(QPointF(tx, ty), 5.0 if is_active else 4.0, 5.0 if is_active else 4.0)
+                ring, fill, radius, width = (
+                    (theme.TERMINAL_ACTIVE, theme.TERMINAL_ACTIVE, 5.0, 1.4)
+                    if is_active
+                    else (theme.TERMINAL_RING, theme.CANVAS_BG, 3.5, 1.3)
+                )
+                painter.setPen(QPen(QColor(ring), width))
+                painter.setBrush(QBrush(QColor(fill)))
+                painter.drawEllipse(QPointF(tx, ty), radius, radius)
 
                 if self.solution and self.extraction:
                     node_name = self.extraction.endpoint_to_node.get(ep)
                     if node_name and node_name in self.solution.node_voltages:
                         voltage = self.solution.node_voltages[node_name]
                         painter.setFont(node_font)
-                        painter.setPen(QPen(QColor("#1B5E20")))
-                        painter.drawText(
-                            QPointF(tx + 7, ty - 6),
-                            f"{node_name}: {voltage:.2f}V",
-                        )
+                        text = f"{node_name} {fixed(voltage, 2)} V{fraction_suffix(voltage)}"
+                        self._draw_node_tag(painter, tx, ty, tx - comp.x, ty - comp.y, text, node_name == "GND")
